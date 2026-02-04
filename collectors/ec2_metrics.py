@@ -1,6 +1,6 @@
 import boto3
 import csv
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 import os
 
@@ -57,4 +57,5 @@ with open(METRICS_FILE, "a", newline="") as f:
         round(latest["net_in"], 2),
         round(latest["net_out"], 2),
     ])
+
 
