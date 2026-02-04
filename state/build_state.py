@@ -1,5 +1,5 @@
 import csv
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 import sys
 
@@ -46,10 +46,11 @@ with open(STATE_FILE, "a", newline="") as f:
         ])
 
     writer.writerow([
-        datetime.utcnow().isoformat(),
+        datetime.now(timezone.utc).isoformat(),
         round(avg_cpu_5, 2),
         round(cpu_trend, 2),
         round(avg_net_in_5, 2),
         round(avg_net_out_5, 2),
         requests_per_min,
+
     ])
