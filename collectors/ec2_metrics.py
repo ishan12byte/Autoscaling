@@ -8,7 +8,7 @@ from config.settings import INSTANCE_ID, REGION, METRICS_FILE
 
 cw = boto3.client("cloudwatch", region_name=REGION)
 
-end = datetime.utcnow()
+end = datetime.utcnow(timezone.utc)
 start = end - timedelta(minutes=10)
 
 def get_metric(name):
@@ -57,3 +57,4 @@ with open(METRICS_FILE, "a", newline="") as f:
         round(latest["net_in"], 2),
         round(latest["net_out"], 2),
     ])
+
