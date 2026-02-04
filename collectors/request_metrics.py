@@ -1,7 +1,7 @@
 import requests
 import csv
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 from config.settings import METRICS_URL, REQUESTS_FILE
 
@@ -27,7 +27,8 @@ with open(REQUESTS_FILE, "a", newline="") as f:
         writer.writerow(["timestamp", "requests_per_min", "requests_total"])
 
     writer.writerow([
-        datetime.utcnow().isoformat(),
+        datetime.now(timezone.utc).isoformat(),
         requests_per_min,
         current_total,
+
     ])
