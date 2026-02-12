@@ -6,7 +6,6 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import boto3
 import csv
 from datetime import datetime, timedelta, timezone
-from collections import defaultdict
 
 from config.settings import INSTANCE_ID, REGION, METRICS_FILE
 
@@ -14,6 +13,7 @@ cw = boto3.client("cloudwatch", region_name=REGION)
 
 end = datetime.now(timezone.utc)
 start = end - timedelta(minutes=10)
+
 
 def get_metric(name):
     return cw.get_metric_statistics(
@@ -26,26 +26,26 @@ def get_metric(name):
         Statistics=["Average"],
     )
 
-cpu = get_metric("CPUUtilization")
-net_in = get_metric("NetworkIn")
-net_out = get_metric("NetworkOut")
 
-data = defaultdict(lambda: {"cpu": 0, "net_in": 0, "net_out": 0})
+def latest_datapoint(metric):
+    if not metric["Datapoints"]:
+        return None
+    return max(metric["Datapoints"], key=lambda x: x["Timestamp"])
 
-for p in cpu["Datapoints"]:
-    data[p["Timestamp"]]["cpu"] = p["Average"]
 
-for p in net_in["Datapoints"]:
-    data[p["Timestamp"]]["net_in"] = p["Average"]
+cpu = latest_datapoint(get_metric("CPUUtilization"))
+net_in = latest_datapoint(get_metric("NetworkIn"))
+net_out = latest_datapoint(get_metric("NetworkOut"))
 
-for p in net_out["Datapoints"]:
-    data[p["Timestamp"]]["net_out"] = p["Average"]
-
-if not data:
+# If CPU missing → skip write (core metric)
+if cpu is None:
     exit(0)
 
-latest_ts = max(data.keys())
-latest = data[latest_ts]
+latest_ts = cpu["Timestamp"]
+
+cpu_val = cpu["Average"]
+net_in_val = net_in["Average"] if net_in else 0
+net_out_val = net_out["Average"] if net_out else 0
 
 file_exists = os.path.exists(METRICS_FILE)
 
@@ -57,11 +57,7 @@ with open(METRICS_FILE, "a", newline="") as f:
 
     writer.writerow([
         latest_ts.isoformat(),
-        round(latest["cpu"], 2),
-        round(latest["net_in"], 2),
-        round(latest["net_out"], 2),
+        round(cpu_val, 2),
+        round(net_in_val, 2),
+        round(net_out_val, 2),
     ])
-
-
-
-
