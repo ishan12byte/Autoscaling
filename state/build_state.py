@@ -1,7 +1,10 @@
-import csv
-from datetime import datetime, timezone
 import os
 import sys
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import csv
+from datetime import datetime, timezone
 import statistics   # NEW → Needed for volatility (std deviation)
 
 from config.settings import METRICS_FILE, REQUESTS_FILE, STATE_FILE
@@ -71,4 +74,5 @@ with open(STATE_FILE, "a", newline="") as f:
         round(net_ratio, 2),       # NEW
         requests_per_min,
     ])
+
 
