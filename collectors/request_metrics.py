@@ -1,6 +1,10 @@
+import sys
+import os
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import requests
 import csv
-import os
 from datetime import datetime, timezone
 
 from config.settings import METRICS_URL, REQUESTS_FILE
@@ -32,3 +36,4 @@ with open(REQUESTS_FILE, "a", newline="") as f:
         current_total,
 
     ])
+
