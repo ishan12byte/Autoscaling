@@ -62,7 +62,7 @@ with open(STATE_FILE, "a", newline="") as f:
         ])
 
     writer.writerow([
-        datetime.utcnow().isoformat(),
+        datetime.now(timezone.utc).isoformat(),
         round(avg_cpu_5, 2),
         round(cpu_trend, 2),
         round(volatility, 2),      # NEW
@@ -71,3 +71,4 @@ with open(STATE_FILE, "a", newline="") as f:
         round(net_ratio, 2),       # NEW
         requests_per_min,
     ])
+
