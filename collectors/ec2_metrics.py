@@ -1,8 +1,12 @@
+import sys
+import os
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import boto3
 import csv
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
-import os
 
 from config.settings import INSTANCE_ID, REGION, METRICS_FILE
 
@@ -57,6 +61,7 @@ with open(METRICS_FILE, "a", newline="") as f:
         round(latest["net_in"], 2),
         round(latest["net_out"], 2),
     ])
+
 
 
 
