@@ -195,6 +195,7 @@ for idx, row in merged.iterrows():
         low_streak = 0
 
     action = "hold"
+    # cooldown handling
     if cooldown_timer > 0:
         cooldown_timer -= 1
     else:
@@ -221,6 +222,7 @@ for idx, row in merged.iterrows():
             oscillation_flag = 1
             oscillation_count += 1
 
+    # set prev_action when an action occurs
     if action != "hold":
         prev_action = action
 
@@ -286,7 +288,7 @@ summary = {
 with open(METRICS_OUT, "w") as mf:
     json.dump(summary, mf, indent=2)
 
-print("\n Baseline simulation finished")
+print("\n✅ Baseline simulation finished")
 print("----------------------------------------")
 print(f"Rows simulated:         {n_rows}")
 print(f"Overload events:        {summary['overload_events']}")
