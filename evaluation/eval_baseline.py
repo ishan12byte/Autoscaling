@@ -50,7 +50,6 @@ report["longest_overload_streak"] = int(max_streak)
 # Cost metrics
 report["avg_instances"] = float(df["instances"].mean())
 report["peak_instances"] = int(df["instances"].max())
-# instance-minutes proxy from rows (assuming sampling interval is consistent)
 report["instance_minutes_proxy"] = float(df["instances"].sum())
 
 # Stability metrics
@@ -68,7 +67,7 @@ with open(OUT_JSON, "w") as f:
     json.dump(report, f, indent=2)
 
 # Print summary
-print("\n Baseline Evaluation Summary")
+print("\n✅ Baseline Evaluation Summary")
 print("---------------------------------------")
 print(f"Rows: {report['rows']}")
 print(f"Overload events: {report['overload_events']} ({report['overload_pct']:.2f}%)")
