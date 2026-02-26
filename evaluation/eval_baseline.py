@@ -67,7 +67,7 @@ with open(OUT_JSON, "w") as f:
     json.dump(report, f, indent=2)
 
 # Print summary
-print("\n✅ Baseline Evaluation Summary")
+print("\n Baseline Evaluation Summary")
 print("---------------------------------------")
 print(f"Rows: {report['rows']}")
 print(f"Overload events: {report['overload_events']} ({report['overload_pct']:.2f}%)")
@@ -79,3 +79,4 @@ print(f"Oscillation events: {report['oscillation_events']} ({report['oscillation
 print(f"Avg queue length: {report['avg_queue_length']:.2f}, Peak queue: {report['peak_queue_length']:.2f}")
 print(f"Avg latency (ms): {report['avg_latency_ms']:.2f}, Peak latency (ms): {report['peak_latency_ms']:.2f}")
 print(f"Saved JSON summary: {OUT_JSON}")
+
