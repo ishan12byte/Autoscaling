@@ -12,7 +12,7 @@ import pandas as pd
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import settings as cfg  # type: ignore
 
-parser = argparse.ArgumentParser(description="Evaluate baseline simulation output (net-aware).")
+parser = argparse.ArgumentParser(description="Evaluate baseline simulation output (net+instances aware).")
 parser.add_argument("--input-csv", type=str, default=os.path.join(getattr(cfg, "DATA_DIR", "data"), "baseline_simulation.csv"))
 parser.add_argument("--metrics-json", type=str, default=os.path.join(getattr(cfg, "DATA_DIR", "data"), "baseline_metrics.json"))
 parser.add_argument("--output-json", type=str, default=os.path.join(getattr(cfg, "DATA_DIR", "data"), "baseline_eval_summary.json"))
@@ -77,9 +77,14 @@ else:
     report["avg_net_throughput"] = None
     report["peak_net_throughput"] = None
 
-if "network_ratio" in df.columns:
-    report["avg_network_ratio"] = float(df["network_ratio"].mean())
-    report["peak_network_ratio"] = float(df["network_ratio"].max())
+if "network_ratio" in df.columns or "network_ratio" in df.columns:
+    # prefer explicit column name if present (older controllers used 'network_ratio' naming)
+    if "network_ratio" in df.columns:
+        report["avg_network_ratio"] = float(df["network_ratio"].mean())
+        report["peak_network_ratio"] = float(df["network_ratio"].max())
+    else:
+        report["avg_network_ratio"] = None
+        report["peak_network_ratio"] = None
 else:
     # try to compute from avg_net_in_5 & avg_net_out_5
     if "avg_net_in_5" in df.columns and "avg_net_out_5" in df.columns:
@@ -102,7 +107,7 @@ else:
     report["avg_cpu_net_target"] = None
     report["avg_cpu_combined_target"] = None
 
-# Prediction MAE: prefer reading metrics JSON if it has mae, otherwise compute local shifted MAE
+# Predictor MAE: prefer metrics JSON if it contains mae, otherwise compute local shifted MAE
 pred_mae = None
 pred_method = None
 if os.path.exists(METRICS_JSON):
