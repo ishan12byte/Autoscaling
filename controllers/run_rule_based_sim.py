@@ -23,7 +23,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import settings as cfg  # type: ignore
 
 # ---------- CLI ----------
-parser = argparse.ArgumentParser(description="Net-aware baseline simulator with CPU predictor.")
+parser = argparse.ArgumentParser(description="Net-aware baseline simulator with corrected OLS predictor.")
 parser.add_argument("--state-file", type=str, default=getattr(cfg, "STATE_FILE", "data/state.csv"))
 parser.add_argument("--requests-file", type=str, default=getattr(cfg, "REQUESTS_FILE", "data/requests.csv"))
 parser.add_argument("--output-csv", type=str, default=os.path.join(getattr(cfg, "DATA_DIR", "data"), "baseline_simulation.csv"))
@@ -93,7 +93,7 @@ if PRED_HORIZON < 1:
 if not (0.0 <= W_REQ <= 1.0 and 0.0 <= W_NET <= 1.0):
     raise ValueError("w-req and w-net must be between 0 and 1")
 
-# normalize weights so they sum to 1 if user didn't
+# normalize weights so they sum to 1
 w_sum = W_REQ + W_NET
 if w_sum == 0:
     W_REQ, W_NET = 0.7, 0.3
@@ -144,44 +144,53 @@ if VERBOSE:
 
 # ---------- estimate bandwidth_per_instance if not provided ----------
 if BANDWIDTH_PER_INSTANCE is None:
-    # estimate from observed mean throughput and max instances to keep ratios reasonable
     net_throughput_series = (merged["avg_net_in_5"].fillna(0.0) + merged["avg_net_out_5"].fillna(0.0))
     mean_throughput = float(net_throughput_series.mean()) if len(net_throughput_series) > 0 else 1.0
-    # allocate mean throughput across max instances (defensive floor)
     BANDWIDTH_PER_INSTANCE = max(1.0, mean_throughput / max(1, MAX_INSTANCES))
     if VERBOSE:
-        print(f"Auto-estimated bandwidth_per_instance = {BANDWIDTH_PER_INSTANCE:.3f} (units match avg_net_*)")
+        print(f"Auto-estimated bandwidth_per_instance = {BANDWIDTH_PER_INSTANCE:.3f}")
 
-# ---------- predictor (OLS) ----------
+# ---------- predictor (corrected OLS) ----------
 use_ols = False
 coeffs = None
 pred_mae_accum = 0.0
 pred_count = 0
 
+# prepare instances_series for training: if merged contains 'instances' use it, else use constant starting instances
+initial_instances = max(MIN_INSTANCES, 1)
+if "instances" in merged.columns:
+    instances_series_all = merged["instances"].fillna(initial_instances).astype(float).values
+else:
+    # fallback constant series
+    instances_series_all = (np.full(n_rows, initial_instances) if np is not None else [initial_instances] * n_rows)
+
 if np is not None and n_rows > PRED_HORIZON + 10:
     try:
-        X_full = np.column_stack([
-            np.ones(n_rows - PRED_HORIZON),
-            merged["requests_per_min"].values[:-PRED_HORIZON],
-            merged["avg_net_in_5"].values[:-PRED_HORIZON],
-            merged["avg_net_out_5"].values[:-PRED_HORIZON],
-            np.ones(n_rows - PRED_HORIZON) * 1.0,  # intercept already present
-        ])
-        y_full = merged["avg_cpu_5"].values[PRED_HORIZON:]
-        # simple lstsq (OLS) ignoring instances; it's a simple predictor for demo
+        h = PRED_HORIZON
+        rows_X = n_rows - h
+        intercept = np.ones(rows_X)
+        cpu_now = merged["avg_cpu_5"].values[:-h]
+        req_now = merged["requests_per_min"].values[:-h]
+        net_in = merged["avg_net_in_5"].values[:-h]
+        net_out = merged["avg_net_out_5"].values[:-h]
+        inst_now = instances_series_all[:-h]
+
+        # Single intercept only; include avg_cpu_5 and instances as predictors
+        X_full = np.column_stack([intercept, cpu_now, req_now, net_in, net_out, inst_now])
+        y_full = merged["avg_cpu_5"].values[h:]
         coeffs, *_ = np.linalg.lstsq(X_full, y_full, rcond=None)
         use_ols = True
         if VERBOSE:
-            print("Trained OLS predictor; coeffs:", coeffs.tolist())
+            print("OLS predictor trained. coeffs:", coeffs.tolist())
     except Exception as e:
-        warnings.warn(f"OLS predictor training failed: {e} — using trend fallback.")
+        warnings.warn(f"OLS predictor training failed: {e}. Falling back to trend predictor.")
         use_ols = False
 else:
     if VERBOSE:
-        print("Not enough data or numpy missing — using trend fallback predictor.")
+        print("Not enough rows or numpy missing — using trend fallback predictor.")
 
 # ---------- simulation state ----------
-instances = max(MIN_INSTANCES, 1)
+instances = initial_instances
 cpu_prev = None
 high_streak = 0
 low_streak = 0
@@ -246,26 +255,33 @@ cpu_prev = min(100.0, init_cpu_combined)
 
 # ---------- helper predictor ----------
 def predict_cpu_for_row(idx):
-    # OLS predictor uses requests/net columns at idx to predict avg_cpu_5 at idx+PRED_HORIZON
+    # If OLS trained, use avg_cpu_5 and instances and request/net features at idx
     if use_ols and np is not None:
-        r = float(merged.iloc[idx]["requests_per_min"])
-        nin = float(merged.iloc[idx]["avg_net_in_5"])
-        nout = float(merged.iloc[idx]["avg_net_out_5"])
-        x = np.array([1.0, r, nin, nout, 1.0])  # matches X_full stacking above
-        pred = float(np.dot(coeffs, x))
-        pred = max(0.0, min(100.0, pred))
-        return pred
+        # build x vector matching training: [1, avg_cpu_5(t), requests(t), net_in(t), net_out(t), instances(t)]
+        try:
+            a_cpu = float(merged.iloc[idx]["avg_cpu_5"])
+            r = float(merged.iloc[idx]["requests_per_min"])
+            nin = float(merged.iloc[idx]["avg_net_in_5"])
+            nout = float(merged.iloc[idx]["avg_net_out_5"])
+            inst = float(instances_series_all[idx])  # training-time instances series (safe fallback)
+            x = np.array([1.0, a_cpu, r, nin, nout, inst])
+            pred = float(np.dot(coeffs, x))
+            pred = max(0.0, min(100.0, pred))
+            return pred
+        except Exception:
+            # fallback to trend
+            pass
+
+    # fallback trend predictor
+    if idx >= 1:
+        prev_cpu = float(merged.iloc[idx-1]["avg_cpu_5"])
+        cur_cpu = float(merged.iloc[idx]["avg_cpu_5"])
+        trend = cur_cpu - prev_cpu
+        pred = float(cur_cpu + trend * PRED_HORIZON)
     else:
-        # trend fallback: use last two avg_cpu_5 to estimate per-step trend
-        if idx >= 1:
-            prev_cpu = float(merged.iloc[idx-1]["avg_cpu_5"])
-            cur_cpu = float(merged.iloc[idx]["avg_cpu_5"])
-            trend = cur_cpu - prev_cpu
-            pred = float(cur_cpu + trend * PRED_HORIZON)
-        else:
-            pred = float(merged.iloc[idx]["avg_cpu_5"])
-        pred = max(0.0, min(100.0, pred))
-        return pred
+        pred = float(merged.iloc[idx]["avg_cpu_5"])
+    pred = max(0.0, min(100.0, pred))
+    return pred
 
 # ---------- main loop ----------
 for idx, row in merged.iterrows():
@@ -312,8 +328,7 @@ for idx, row in merged.iterrows():
         queue_length = max(0.0, requests - effective_capacity)
     queue_prev = queue_length
 
-    # latency proxy uses combined load ratio (request + network implicit)
-    combined_load_ratio = request_ratio * (1.0 + 0.0)  # kept explicit for clarity
+    # latency proxy
     latency_ms = BASE_LATENCY * (1.0 + (request_ratio + network_ratio) ** 2)
 
     # streak/hysteresis
