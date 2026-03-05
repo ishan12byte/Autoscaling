@@ -375,7 +375,7 @@ summary = {
 with open(METRICS_OUT, "w") as mf:
     json.dump(summary, mf, indent=2)
 
-print("\n✅ Baseline simulation finished")
+print("\n Baseline simulation finished")
 print("----------------------------------------")
 print(f"Rows simulated:         {n_rows}")
 print(f"Overload events:        {summary['overload_events']}")
@@ -389,3 +389,4 @@ print(f"Summary JSON:           {METRICS_OUT}")
 if VERBOSE:
     print("\nParameters used:")
     print(json.dumps(summary["parameters"], indent=2))
+
