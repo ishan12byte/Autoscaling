@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # evaluation/eval_baseline.py
-
+"""
+Evaluator for rule-based baseline simulation output.
+Reads baseline CSV and produces a JSON summary + printed report.
+(STRICTLY NO ML/OLS code here.)
+"""
 import sys
 import os
 import json
@@ -12,17 +16,13 @@ import pandas as pd
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import settings as cfg  # type: ignore
 
-parser = argparse.ArgumentParser(description="Evaluate baseline simulation output (net+instances aware).")
+parser = argparse.ArgumentParser(description="Evaluate baseline simulation output.")
 parser.add_argument("--input-csv", type=str, default=os.path.join(getattr(cfg, "DATA_DIR", "data"), "baseline_simulation.csv"))
-parser.add_argument("--metrics-json", type=str, default=os.path.join(getattr(cfg, "DATA_DIR", "data"), "baseline_metrics.json"))
 parser.add_argument("--output-json", type=str, default=os.path.join(getattr(cfg, "DATA_DIR", "data"), "baseline_eval_summary.json"))
-parser.add_argument("--pred-horizon", type=int, default=5)
 args = parser.parse_args()
 
 INPUT = args.input_csv
-METRICS_JSON = args.metrics_json
 OUT_JSON = args.output_json
-PRED_HORIZON = int(args.pred_horizon)
 
 if not os.path.exists(INPUT):
     raise FileNotFoundError(f"Baseline CSV not found: {INPUT}")
@@ -40,7 +40,7 @@ report["rows"] = len(df)
 
 # Overload
 report["overload_events"] = int(df["overload_flag"].sum())
-report["overload_pct"] = float(100.0 * df["overload_flag"].sum() / len(df))
+report["overload_pct"] = float(100.0 * df["overload_flag"].sum() / len(df)) if len(df) > 0 else 0.0
 
 # Longest overload streak
 streak = 0
@@ -57,7 +57,10 @@ report["longest_overload_streak"] = int(max_streak)
 # Cost
 report["avg_instances"] = float(df["instances"].mean())
 report["peak_instances"] = int(df["instances"].max())
-report["instance_minutes_proxy"] = float(df["instances"].sum())
+# instance-minutes proxy: sum(instances) * (sampling_interval_seconds/60)
+# We don't have sampling interval in file—use settings if available
+sampling_interval = getattr(cfg, "SAMPLING_INTERVAL", 60)
+report["instance_minutes_proxy"] = float(df["instances"].sum() * (sampling_interval / 60.0))
 
 # Stability
 report["oscillation_events"] = int(df["oscillation_flag"].sum()) if "oscillation_flag" in df.columns else 0
@@ -77,26 +80,6 @@ else:
     report["avg_net_throughput"] = None
     report["peak_net_throughput"] = None
 
-if "network_ratio" in df.columns or "network_ratio" in df.columns:
-    # prefer explicit column name if present (older controllers used 'network_ratio' naming)
-    if "network_ratio" in df.columns:
-        report["avg_network_ratio"] = float(df["network_ratio"].mean())
-        report["peak_network_ratio"] = float(df["network_ratio"].max())
-    else:
-        report["avg_network_ratio"] = None
-        report["peak_network_ratio"] = None
-else:
-    # try to compute from avg_net_in_5 & avg_net_out_5
-    if "avg_net_in_5" in df.columns and "avg_net_out_5" in df.columns:
-        ratios = []
-        for nin, nout in zip(df["avg_net_in_5"].fillna(0).values, df["avg_net_out_5"].fillna(0).values):
-            ratios.append(nout / (nin + 1e-9))
-        report["avg_network_ratio"] = float(mean(ratios)) if ratios else None
-        report["peak_network_ratio"] = float(max(ratios)) if ratios else None
-    else:
-        report["avg_network_ratio"] = None
-        report["peak_network_ratio"] = None
-
 # CPU breakdown averages if available
 if "cpu_req_target" in df.columns and "cpu_net_target" in df.columns:
     report["avg_cpu_req_target"] = float(df["cpu_req_target"].mean())
@@ -106,42 +89,6 @@ else:
     report["avg_cpu_req_target"] = None
     report["avg_cpu_net_target"] = None
     report["avg_cpu_combined_target"] = None
-
-# Predictor MAE: prefer metrics JSON if it contains mae, otherwise compute local shifted MAE
-pred_mae = None
-pred_method = None
-if os.path.exists(METRICS_JSON):
-    try:
-        with open(METRICS_JSON, "r") as mf:
-            m = json.load(mf)
-        if "prediction" in m and isinstance(m["prediction"], dict) and "mae" in m["prediction"]:
-            pred_mae = m["prediction"]["mae"]
-            pred_method = m["prediction"].get("method", None)
-            report["prediction_horizon_steps"] = m["prediction"].get("horizon_steps", None)
-    except Exception:
-        pred_mae = None
-
-# compute local MAE if needed and possible
-if pred_mae is None and "predicted_cpu_5" in df.columns and "cpu_smoothed" in df.columns:
-    ph = report.get("prediction_horizon_steps", PRED_HORIZON) if 'PRED_HORIZON' in globals() else PRED_HORIZON
-    errors = []
-    n = len(df)
-    for i in range(0, n):
-        j = i + ph
-        if j < n:
-            try:
-                pred = float(df.iloc[i]["predicted_cpu_5"])
-                actual = float(df.iloc[j]["cpu_smoothed"])
-                errors.append(abs(pred - actual))
-            except Exception:
-                pass
-    if errors:
-        pred_mae = float(sum(errors) / len(errors))
-        pred_method = "local_shift_mae"
-        report["prediction_horizon_steps"] = ph
-
-report["prediction_mae"] = pred_mae
-report["prediction_method"] = pred_method
 
 # Save JSON summary
 with open(OUT_JSON, "w") as f:
@@ -155,16 +102,12 @@ print(f"Overload events: {report['overload_events']} ({report['overload_pct']:.2
 print(f"Longest overload streak: {report['longest_overload_streak']}")
 print(f"Average instances: {report['avg_instances']:.2f}")
 print(f"Peak instances: {report['peak_instances']}")
-print(f"Instance-minutes (proxy): {report['instance_minutes_proxy']}")
+print(f"Instance-minutes (proxy): {report['instance_minutes_proxy']:.2f}")
 print(f"Oscillation events: {report['oscillation_events']} ({report['oscillation_rate_pct']:.2f}%)")
 print(f"Avg queue length: {report['avg_queue_length']:.2f}, Peak queue: {report['peak_queue_length']:.2f}")
 print(f"Avg latency (ms): {report['avg_latency_ms']:.2f}, Peak latency (ms): {report['peak_latency_ms']:.2f}")
 if report["avg_net_throughput"] is not None:
     print(f"Avg net throughput: {report['avg_net_throughput']:.2f}, Peak: {report['peak_net_throughput']:.2f}")
-if report["avg_network_ratio"] is not None:
-    print(f"Avg network_ratio: {report['avg_network_ratio']:.3f}, Peak network_ratio: {report['peak_network_ratio']:.3f}")
 if report["avg_cpu_req_target"] is not None:
     print(f"Avg cpu_req_target: {report['avg_cpu_req_target']:.2f}, Avg cpu_net_target: {report['avg_cpu_net_target']:.2f}")
-if report["prediction_mae"] is not None:
-    print(f"Prediction MAE: {report['prediction_mae']} (method: {report['prediction_method']})")
 print(f"Saved JSON summary: {OUT_JSON}")
