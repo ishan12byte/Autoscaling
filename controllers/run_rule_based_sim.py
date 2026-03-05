@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 # controllers/run_rule_based_sim.py
 """
-Net-aware baseline simulator + two-pass bootstrap OLS predictor.
+Net-aware rule-based baseline simulator (NO ML / NO OLS).
+Reads state + requests, simulates capacity & CPU, applies rule-based scaling,
+logs per-step CSV and produces a summary JSON.
 
-Workflow:
- - Merge state + requests
- - PASS 1: simulate with trend predictor (no OLS). Produces simulated instances series.
- - Train OLS using merged data and PASS1 instances series.
- - PASS 2: simulate again with OLS predictor enabled (uses trained coeffs).
- - Write final CSV and metrics JSON (summary includes predictor MAE).
-
-This keeps things simple, deterministic, and ensures the predictor sees the actual simulated
-instances used during scaling.
+Usage example:
+python controllers/run_rule_based_sim.py \
+  --state-file data/train_state.csv \
+  --requests-file data/train_requests.csv \
+  --output-csv data/train_baseline.csv
 """
-
 import sys
 import os
 import math
@@ -25,18 +22,12 @@ from datetime import datetime, timezone
 import pandas as pd
 import argparse
 
-# optional numpy for OLS predictor; fallback allowed
-try:
-    import numpy as np
-except Exception:
-    np = None
-
 # allow import from project root
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import settings as cfg  # type: ignore
 
 # ---------- CLI ----------
-parser = argparse.ArgumentParser(description="Net-aware baseline simulator with two-pass OLS bootstrap.")
+parser = argparse.ArgumentParser(description="Net-aware rule-based baseline simulator (no ML).")
 parser.add_argument("--state-file", type=str, default=getattr(cfg, "STATE_FILE", "data/state.csv"))
 parser.add_argument("--requests-file", type=str, default=getattr(cfg, "REQUESTS_FILE", "data/requests.csv"))
 parser.add_argument("--output-csv", type=str, default=os.path.join(getattr(cfg, "DATA_DIR", "data"), "baseline_simulation.csv"))
@@ -60,7 +51,6 @@ parser.add_argument("--sampling-interval-seconds", type=int, default=getattr(cfg
 parser.add_argument("--merge-tolerance-multiplier", type=float, default=1.1)
 parser.add_argument("--queue-persistence", action="store_true")
 parser.add_argument("--clamp-load-ratio", type=float, default=5.0)
-parser.add_argument("--pred-horizon", type=int, default=5)
 parser.add_argument("--verbose", action="store_true")
 args = parser.parse_args()
 
@@ -93,7 +83,6 @@ MERGE_TOL = pd.Timedelta(seconds=int(SAMPLING_INTERVAL * args.merge_tolerance_mu
 
 QUEUE_PERSISTENCE = bool(args.queue_persistence)
 LOAD_RATIO_CLAMP = float(args.clamp_load_ratio)
-PRED_HORIZON = int(args.pred_horizon)
 VERBOSE = bool(args.verbose)
 
 # ---------- defensive checks ----------
@@ -101,8 +90,6 @@ if not os.path.exists(STATE_FILE):
     raise FileNotFoundError(f"state CSV not found: {STATE_FILE}")
 if INEFFICIENCY <= 0 or INEFFICIENCY > 1.0:
     raise ValueError("inefficiency must be in (0,1].")
-if PRED_HORIZON < 1:
-    raise ValueError("pred-horizon must be >= 1")
 if not (0.0 <= W_REQ <= 1.0 and 0.0 <= W_NET <= 1.0):
     raise ValueError("w-req and w-net must be between 0 and 1")
 
@@ -163,307 +150,208 @@ if BANDWIDTH_PER_INSTANCE is None:
     if VERBOSE:
         print(f"Auto-estimated bandwidth_per_instance = {BANDWIDTH_PER_INSTANCE:.3f}")
 
-# ---------- helper: simulation pass (returns row list + instances series) ----------
-def simulate_pass(use_ols, coeffs=None, training_instances=None, write_rows=False):
-    """
-    Run a simulation pass.
-    - use_ols: whether predict_cpu_for_row will use coeffs
-    - coeffs: numpy array (or None)
-    - training_instances: list/array used only for training building when required (not used inside pass)
-    - write_rows: if True, write rows to OUTPUT_FILE; otherwise return rows in memory
-    Returns:
-      rows_out: list of dicts (per-row)
-      instances_series: list of instances used per timestep
-      pred_mae_accum, pred_count (for OLS MAE calc during pass)
-    """
-    instances_local = max(MIN_INSTANCES, 1)
-    cpu_prev_local = None
-    high_streak_local = 0
-    low_streak_local = 0
-    cooldown_timer_local = 0
-    prev_action_local = None
-    queue_prev_local = 0.0
+# ---------- simulation state ----------
+instances = max(MIN_INSTANCES, 1)
+cpu_prev = None
+high_streak = 0
+low_streak = 0
+cooldown_timer = 0
+prev_action = None
+queue_prev = 0.0
 
-    oscillation_count_local = 0
-    overload_count_local = 0
-    total_instance_minutes_local = 0.0
-    peak_queue_local = 0.0
-    latency_accum_local = 0.0
+oscillation_count = 0
+overload_count = 0
+total_instance_minutes = 0.0
+peak_queue = 0.0
+latency_accum = 0.0
 
-    rows_out = []
-    instances_series = []
-    pred_mae_acc = 0.0
-    pred_cnt = 0
-
-    for idx, row in merged.iterrows():
-        timestamp = row["timestamp"]
-        requests = float(row.get("requests_per_min", 0.0))
-        net_in = float(row.get("avg_net_in_5", 0.0))
-        net_out = float(row.get("avg_net_out_5", 0.0))
-        net_throughput = net_in + net_out
-
-        capacity = instances_local * WORKERS_PER_INSTANCE
-        effective_capacity = max(0.1, capacity * INEFFICIENCY)
-
-        # request-driven ratio
-        request_ratio = requests / effective_capacity if effective_capacity > 0 else float("inf")
-        request_ratio = min(request_ratio, LOAD_RATIO_CLAMP)
-
-        # network capacity and ratio
-        network_capacity = max(0.1, instances_local * BANDWIDTH_PER_INSTANCE * INEFFICIENCY)
-        network_ratio = net_throughput / network_capacity if network_capacity > 0 else float("inf")
-        network_ratio = min(network_ratio, LOAD_RATIO_CLAMP)
-
-        # CPU contributions
-        cpu_req_target = 100.0 * (1.0 - math.exp(-K_REQ * request_ratio))
-        cpu_req_target = min(cpu_req_target, 100.0)
-
-        cpu_net_target = 100.0 * (1.0 - math.exp(-K_NET * network_ratio))
-        cpu_net_target = min(cpu_net_target, 100.0)
-
-        cpu_target_combined = W_REQ * cpu_req_target + W_NET * cpu_net_target
-        cpu_target_combined = min(cpu_target_combined, 100.0)
-
-        if cpu_prev_local is None:
-            cpu_prev_local = cpu_target_combined
-
-        cpu_smoothed_local = ALPHA * cpu_target_combined + (1.0 - ALPHA) * cpu_prev_local
-        cpu_smoothed_local = min(max(cpu_smoothed_local, 0.0), 100.0)
-
-        # queue persistence optional
-        if QUEUE_PERSISTENCE:
-            queue_length = max(0.0, queue_prev_local + requests - effective_capacity)
-        else:
-            queue_length = max(0.0, requests - effective_capacity)
-        queue_prev_local = queue_length
-
-        # latency proxy
-        latency_ms = BASE_LATENCY * (1.0 + (request_ratio + network_ratio) ** 2)
-
-        # streak/hysteresis
-        if cpu_smoothed_local > 70.0:
-            high_streak_local += 1
-            low_streak_local = 0
-        elif cpu_smoothed_local < 30.0:
-            low_streak_local += 1
-            high_streak_local = 0
-        else:
-            high_streak_local = 0
-            low_streak_local = 0
-
-        # action decision with cooldown
-        action = "hold"
-        if cooldown_timer_local > 0:
-            cooldown_timer_local -= 1
-        else:
-            if high_streak_local >= SCALE_UP_STREAK:
-                new_instances_local = min(MAX_INSTANCES, instances_local + 1)
-                if new_instances_local != instances_local:
-                    action = "scale_up"
-                instances_local = new_instances_local
-                high_streak_local = 0
-                cooldown_timer_local = COOLDOWN_STEPS
-            elif low_streak_local >= SCALE_DOWN_STREAK:
-                new_instances_local = max(MIN_INSTANCES, instances_local - 1)
-                if new_instances_local != instances_local:
-                    action = "scale_down"
-                instances_local = new_instances_local
-                low_streak_local = 0
-                cooldown_timer_local = COOLDOWN_STEPS
-
-        # oscillation detection
-        oscillation_flag = 0
-        if prev_action_local is not None:
-            if (prev_action_local == "scale_up" and action == "scale_down") or \
-               (prev_action_local == "scale_down" and action == "scale_up"):
-                oscillation_flag = 1
-                oscillation_count_local += 1
-
-        prev_action_logged = prev_action_local if prev_action_local is not None else ""
-        if action != "hold":
-            prev_action_local = action
-
-        # overload if either resource ratio > 1
-        overload_flag = int((request_ratio > 1.0) or (network_ratio > 1.0))
-        overload_count_local += overload_flag
-
-        # predictor: if use_ols and coeffs provided, use them; otherwise fallback trend
-        if use_ols and (coeffs is not None) and (np is not None):
-            # Build feature vector: [1, avg_cpu_5(t), requests(t), net_in(t), net_out(t), instances(t)]
-            try:
-                a_cpu = float(merged.iloc[idx]["avg_cpu_5"])
-                r = float(requests)
-                nin = float(net_in)
-                nout = float(net_out)
-                inst = float(instances_local)
-                x = np.array([1.0, a_cpu, r, nin, nout, inst])
-                predicted_cpu = float(np.dot(coeffs, x))
-                predicted_cpu = max(0.0, min(100.0, predicted_cpu))
-            except Exception:
-                # fallback to trend
-                if idx >= 1:
-                    prev_cpu = float(merged.iloc[idx-1]["avg_cpu_5"])
-                    cur_cpu = float(merged.iloc[idx]["avg_cpu_5"])
-                    trend = cur_cpu - prev_cpu
-                    predicted_cpu = float(cur_cpu + trend * PRED_HORIZON)
-                else:
-                    predicted_cpu = float(merged.iloc[idx]["avg_cpu_5"])
-                predicted_cpu = max(0.0, min(100.0, predicted_cpu))
-        else:
-            # trend fallback predictor
-            if idx >= 1:
-                prev_cpu = float(merged.iloc[idx-1]["avg_cpu_5"])
-                cur_cpu = float(merged.iloc[idx]["avg_cpu_5"])
-                trend = cur_cpu - prev_cpu
-                predicted_cpu = float(cur_cpu + trend * PRED_HORIZON)
-            else:
-                predicted_cpu = float(merged.iloc[idx]["avg_cpu_5"])
-            predicted_cpu = max(0.0, min(100.0, predicted_cpu))
-
-        # if we can compute MAE in pass when using coeffs and future exists
-        if use_ols and (np is not None) and (idx + PRED_HORIZON < n_rows) and (coeffs is not None):
-            actual_future = float(merged.iloc[idx + PRED_HORIZON]["avg_cpu_5"])
-            pred_mae_acc += abs(predicted_cpu - actual_future)
-            pred_cnt += 1
-
-        # costs & accumulators
-        total_instance_minutes_local += instances_local * (SAMPLING_INTERVAL / 60.0)
-        peak_queue_local = max(peak_queue_local, queue_length)
-        latency_accum_local += latency_ms
-
-        # collect row
-        row_out = {
-            "timestamp": timestamp.isoformat(),
-            "requests": round(requests, 4),
-            "instances": instances_local,
-            "capacity": capacity,
-            "effective_capacity": round(effective_capacity, 4),
-            "request_ratio": round(request_ratio, 4),
-            "net_throughput": round(net_throughput, 4),
-            "network_capacity": round(network_capacity, 4),
-            "network_ratio": round(network_ratio, 4),
-            "cpu_req_target": round(cpu_req_target, 4),
-            "cpu_net_target": round(cpu_net_target, 4),
-            "cpu_target_combined": round(cpu_target_combined, 4),
-            "cpu_smoothed": round(cpu_smoothed_local, 4),
-            "predicted_cpu_5": round(predicted_cpu, 4),
-            "latency_ms": round(latency_ms, 4),
-            "queue_length": round(queue_length, 4),
-            "high_streak": int(high_streak_local),
-            "low_streak": int(low_streak_local),
-            "cooldown_timer": int(cooldown_timer_local),
-            "action": action,
-            "prev_action": prev_action_logged,
-            "oscillation_flag": int(oscillation_flag),
-            "overload_flag": int(overload_flag)
-        }
-
-        rows_out.append(row_out)
-        instances_series.append(instances_local)
-
-        # advance
-        cpu_prev_local = cpu_smoothed_local
-
-    # return everything
-    return rows_out, instances_series, pred_mae_acc, pred_cnt, {
-        "oscillation_count": oscillation_count_local,
-        "overload_count": overload_count_local,
-        "total_instance_minutes": total_instance_minutes_local,
-        "peak_queue": peak_queue_local,
-        "latency_accum": latency_accum_local
-    }
-
-# ---------- PASS 1: run simulation without OLS (trend predictor) to get instances_series ----------
-if VERBOSE:
-    print("PASS 1 — running initial simulation (no OLS) to collect instances history...")
-rows1, instances1, _, _, stats1 = simulate_pass(use_ols=False, coeffs=None, write_rows=False)
-
-if VERBOSE:
-    print(f"PASS 1 complete. Example head rows: {rows1[:2]}")
-
-# ---------- Train OLS using PASS1 instances as the instances column ----------
-use_ols = False
-coeffs = None
-pred_mae_accum = 0.0
-pred_count = 0
-
-# Build training arrays using merged and instances1
-if np is not None and n_rows > PRED_HORIZON + 10:
-    try:
-        h = PRED_HORIZON
-        rows_X = n_rows - h
-        intercept = np.ones(rows_X)
-        cpu_now = merged["avg_cpu_5"].values[:-h]
-        req_now = merged["requests_per_min"].values[:-h]
-        net_in = merged["avg_net_in_5"].values[:-h]
-        net_out = merged["avg_net_out_5"].values[:-h]
-        inst_now = np.array(instances1[:-h], dtype=float)
-
-        X_full = np.column_stack([intercept, cpu_now, req_now, net_in, net_out, inst_now])
-        y_full = merged["avg_cpu_5"].values[h:]
-        coeffs, *_ = np.linalg.lstsq(X_full, y_full, rcond=None)
-        use_ols = True
-        if VERBOSE:
-            print("PASS 1-based OLS trained. coeffs:", coeffs.tolist())
-    except Exception as e:
-        warnings.warn(f"OLS training on PASS1 data failed: {e}. Falling back to trend predictor.")
-        use_ols = False
-else:
-    if VERBOSE:
-        print("Not enough rows or numpy missing — skipping OLS training and using trend predictor.")
-
-# ---------- PASS 2: run final simulation with trained OLS (if available) and write final CSV ----------
-if VERBOSE:
-    print("PASS 2 — running final simulation with trained predictor (if available) and writing CSV...")
-
-# run final pass (use trained coeffs if use_ols True)
-rows2, instances2, pred_mae_accum, pred_count, stats2 = simulate_pass(use_ols=use_ols, coeffs=coeffs)
-
-# write final CSV (overwrite or append? we'll append as before but better to create fresh file)
-# create/overwrite output CSV to ensure results come from PASS2 only
+# ---------- output CSV ----------
 headers = [
-    "timestamp", "requests", "instances", "capacity", "effective_capacity", "request_ratio",
-    "net_throughput", "network_capacity", "network_ratio", "cpu_req_target", "cpu_net_target",
-    "cpu_target_combined", "cpu_smoothed", "predicted_cpu_5", "latency_ms", "queue_length",
-    "high_streak", "low_streak", "cooldown_timer", "action", "prev_action", "oscillation_flag",
+    "timestamp",
+    "requests",
+    "instances",
+    "capacity",
+    "effective_capacity",
+    "request_ratio",
+    "net_throughput",
+    "network_capacity",
+    "network_ratio",
+    "cpu_req_target",
+    "cpu_net_target",
+    "cpu_target_combined",
+    "cpu_smoothed",
+    "latency_ms",
+    "queue_length",
+    "high_streak",
+    "low_streak",
+    "cooldown_timer",
+    "action",
+    "prev_action",
+    "oscillation_flag",
     "overload_flag"
 ]
-
-# Ensure directory exists
 os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
-with open(OUTPUT_FILE, "w", newline="") as f:
-    writer = csv.writer(f)
-    writer.writerow(headers)
-    for r in rows2:
-        writer.writerow([
-            r["timestamp"], r["requests"], r["instances"], r["capacity"], r["effective_capacity"],
-            r["request_ratio"], r["net_throughput"], r["network_capacity"], r["network_ratio"],
-            r["cpu_req_target"], r["cpu_net_target"], r["cpu_target_combined"], r["cpu_smoothed"],
-            r["predicted_cpu_5"], r["latency_ms"], r["queue_length"], r["high_streak"],
-            r["low_streak"], r["cooldown_timer"], r["action"], r["prev_action"],
-            r["oscillation_flag"], r["overload_flag"]
-        ])
+file_exists = os.path.exists(OUTPUT_FILE)
+out_f = open(OUTPUT_FILE, "w", newline="")
+writer = csv.writer(out_f)
+writer.writerow(headers)
 
-# compute PASS2 summary
-n_rows2 = len(rows2)
-total_instance_minutes = stats2["total_instance_minutes"]
-avg_instances = (total_instance_minutes / ((SAMPLING_INTERVAL / 60.0) * n_rows2)) if n_rows2 > 0 else 0.0
-avg_latency = (stats2["latency_accum"] / n_rows2) if n_rows2 > 0 else 0.0
-pred_mae = (pred_mae_accum / pred_count) if pred_count > 0 else None
+# ---------- init cpu_prev ----------
+first_row = merged.iloc[0]
+init_requests = float(first_row.get("requests_per_min", 0.0))
+init_capacity = instances * WORKERS_PER_INSTANCE
+init_effective_capacity = max(0.1, init_capacity * INEFFICIENCY)
+init_request_ratio = init_requests / init_effective_capacity if init_effective_capacity > 0 else 0.0
+init_request_ratio = min(init_request_ratio, LOAD_RATIO_CLAMP)
+init_net_throughput = float(first_row.get("avg_net_in_5", 0.0)) + float(first_row.get("avg_net_out_5", 0.0))
+init_network_capacity = max(0.1, instances * BANDWIDTH_PER_INSTANCE * INEFFICIENCY)
+init_network_ratio = init_net_throughput / init_network_capacity if init_network_capacity > 0 else 0.0
+init_network_ratio = min(init_network_ratio, LOAD_RATIO_CLAMP)
+
+init_cpu_req = 100.0 * (1.0 - math.exp(-K_REQ * init_request_ratio))
+init_cpu_net = 100.0 * (1.0 - math.exp(-K_NET * init_network_ratio))
+init_cpu_combined = W_REQ * init_cpu_req + W_NET * init_cpu_net
+cpu_prev = min(100.0, init_cpu_combined)
+
+# ---------- main loop ----------
+for idx, row in merged.iterrows():
+    timestamp = row["timestamp"]
+    requests = float(row.get("requests_per_min", 0.0))
+    net_in = float(row.get("avg_net_in_5", 0.0))
+    net_out = float(row.get("avg_net_out_5", 0.0))
+    net_throughput = net_in + net_out
+
+    capacity = instances * WORKERS_PER_INSTANCE
+    effective_capacity = max(0.1, capacity * INEFFICIENCY)
+
+    # request-driven ratio
+    request_ratio = requests / effective_capacity if effective_capacity > 0 else float("inf")
+    request_ratio = min(request_ratio, LOAD_RATIO_CLAMP)
+
+    # network capacity and ratio
+    network_capacity = max(0.1, instances * BANDWIDTH_PER_INSTANCE * INEFFICIENCY)
+    network_ratio = net_throughput / network_capacity if network_capacity > 0 else float("inf")
+    network_ratio = min(network_ratio, LOAD_RATIO_CLAMP)
+
+    # CPU contributions
+    cpu_req_target = 100.0 * (1.0 - math.exp(-K_REQ * request_ratio))
+    cpu_req_target = min(cpu_req_target, 100.0)
+
+    cpu_net_target = 100.0 * (1.0 - math.exp(-K_NET * network_ratio))
+    cpu_net_target = min(cpu_net_target, 100.0)
+
+    cpu_target_combined = W_REQ * cpu_req_target + W_NET * cpu_net_target
+    cpu_target_combined = min(cpu_target_combined, 100.0)
+
+    # smoothing
+    cpu_smoothed = ALPHA * cpu_target_combined + (1.0 - ALPHA) * cpu_prev
+    cpu_smoothed = min(max(cpu_smoothed, 0.0), 100.0)
+
+    # queue persistence optional
+    if QUEUE_PERSISTENCE:
+        queue_length = max(0.0, queue_prev + requests - effective_capacity)
+    else:
+        queue_length = max(0.0, requests - effective_capacity)
+    queue_prev = queue_length
+
+    # latency proxy
+    latency_ms = BASE_LATENCY * (1.0 + (request_ratio + network_ratio) ** 2)
+
+    # streak/hysteresis
+    if cpu_smoothed > 70.0:
+        high_streak += 1
+        low_streak = 0
+    elif cpu_smoothed < 30.0:
+        low_streak += 1
+        high_streak = 0
+    else:
+        high_streak = 0
+        low_streak = 0
+
+    # action decision with cooldown
+    action = "hold"
+    if cooldown_timer > 0:
+        cooldown_timer -= 1
+    else:
+        if high_streak >= SCALE_UP_STREAK:
+            new_instances = min(MAX_INSTANCES, instances + 1)
+            if new_instances != instances:
+                action = "scale_up"
+            instances = new_instances
+            high_streak = 0
+            cooldown_timer = COOLDOWN_STEPS
+        elif low_streak >= SCALE_DOWN_STREAK:
+            new_instances = max(MIN_INSTANCES, instances - 1)
+            if new_instances != instances:
+                action = "scale_down"
+            instances = new_instances
+            low_streak = 0
+            cooldown_timer = COOLDOWN_STEPS
+
+    # oscillation detection
+    oscillation_flag = 0
+    if prev_action is not None:
+        if (prev_action == "scale_up" and action == "scale_down") or \
+           (prev_action == "scale_down" and action == "scale_up"):
+            oscillation_flag = 1
+            oscillation_count += 1
+
+    prev_action_logged = prev_action if prev_action is not None else ""
+    if action != "hold":
+        prev_action = action
+
+    # overload if either resource ratio > 1
+    overload_flag = int((request_ratio > 1.0) or (network_ratio > 1.0))
+    overload_count += overload_flag
+
+    # costs & accumulators
+    total_instance_minutes += instances * (SAMPLING_INTERVAL / 60.0)
+    peak_queue = max(peak_queue, queue_length)
+    latency_accum += latency_ms
+
+    # write row
+    writer.writerow([
+        timestamp.isoformat(),
+        round(requests, 4),
+        instances,
+        capacity,
+        round(effective_capacity, 4),
+        round(request_ratio, 4),
+        round(net_throughput, 4),
+        round(network_capacity, 4),
+        round(network_ratio, 4),
+        round(cpu_req_target, 4),
+        round(cpu_net_target, 4),
+        round(cpu_target_combined, 4),
+        round(cpu_smoothed, 4),
+        round(latency_ms, 4),
+        round(queue_length, 4),
+        int(high_streak),
+        int(low_streak),
+        int(cooldown_timer),
+        action,
+        prev_action_logged,
+        int(oscillation_flag),
+        int(overload_flag)
+    ])
+
+    # advance
+    cpu_prev = cpu_smoothed
+
+# close and summarize
+out_f.close()
+
+avg_instances = (total_instance_minutes / ((SAMPLING_INTERVAL / 60.0) * n_rows)) if n_rows > 0 else 0.0
+avg_latency = (latency_accum / n_rows) if n_rows > 0 else 0.0
 
 summary = {
-    "rows_simulated": n_rows2,
-    "overload_events": int(stats2["overload_count"]) if "overload_count" in stats2 else None,
-    "oscillation_count": int(stats2["oscillation_count"]) if "oscillation_count" in stats2 else None,
+    "rows_simulated": n_rows,
+    "overload_events": int(overload_count),
+    "oscillation_count": int(oscillation_count),
     "total_instance_minutes": round(total_instance_minutes, 3),
     "avg_instances": round(avg_instances, 3),
-    "peak_queue_length": round(stats2["peak_queue"], 3),
+    "peak_queue_length": round(peak_queue, 3),
     "avg_latency_ms": round(avg_latency, 3),
-    "prediction": {
-        "method": "ols" if use_ols else "trend_fallback",
-        "horizon_steps": PRED_HORIZON,
-        "mae": round(pred_mae, 3) if pred_mae is not None else None
-    },
     "parameters": {
         "max_instances": MAX_INSTANCES,
         "min_instances": MIN_INSTANCES,
@@ -487,20 +375,17 @@ summary = {
 with open(METRICS_OUT, "w") as mf:
     json.dump(summary, mf, indent=2)
 
-print("\n✅ Baseline simulation (two-pass) finished")
+print("\n✅ Baseline simulation finished")
 print("----------------------------------------")
-print(f"Rows simulated (final):  {n_rows2}")
-print(f"Total instance-minutes:  {summary['total_instance_minutes']}")
-print(f"Average instances:       {summary['avg_instances']}")
-print(f"Prediction method:       {summary['prediction']['method']}")
-print(f"Prediction MAE:          {summary['prediction']['mae']}")
-print(f"CSV output:              {OUTPUT_FILE}")
-print(f"Summary JSON:            {METRICS_OUT}")
-
+print(f"Rows simulated:         {n_rows}")
+print(f"Overload events:        {summary['overload_events']}")
+print(f"Oscillation_count:      {summary['oscillation_count']}")
+print(f"Total instance-minutes: {summary['total_instance_minutes']}")
+print(f"Average instances:      {summary['avg_instances']}")
+print(f"Peak queue length:      {summary['peak_queue_length']}")
+print(f"Average latency (ms):   {summary['avg_latency_ms']}")
+print(f"CSV output:             {OUTPUT_FILE}")
+print(f"Summary JSON:           {METRICS_OUT}")
 if VERBOSE:
-    print("\nPASS1 stats (example):")
-    print(stats1)
-    print("\nPASS2 stats (example):")
-    print(stats2)
-    if use_ols:
-        print("Trained coeffs (OLS):", coeffs.tolist())
+    print("\nParameters used:")
+    print(json.dumps(summary["parameters"], indent=2))
