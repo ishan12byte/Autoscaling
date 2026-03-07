@@ -2,8 +2,10 @@ import os
 import pandas as pd
 
 TRAIN_RATIO = 0.7
-SNAPSHOT_DIR = "snapshots"
-OUTPUT_DIR = "data"
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SNAPSHOT_DIR = os.path.join(BASE_DIR, "snapshots")
+OUTPUT_DIR = os.path.join(BASE_DIR, "data")
 
 
 def get_latest_snapshot():
@@ -47,12 +49,15 @@ def main():
     state_df = pd.read_csv(state_file)
     req_df = pd.read_csv(requests_file)
 
+    # Convert timestamps
     state_df["timestamp"] = pd.to_datetime(state_df["timestamp"])
     req_df["timestamp"] = pd.to_datetime(req_df["timestamp"])
 
+    # Sort chronologically (critical for time-series ML)
     state_df = state_df.sort_values("timestamp")
     req_df = req_df.sort_values("timestamp")
 
+    # Merge datasets safely by time
     merged = pd.merge_asof(
         state_df,
         req_df,
@@ -60,6 +65,7 @@ def main():
         direction="nearest"
     )
 
+    # Time-series safe split
     total_rows = len(merged)
     split_idx = int(total_rows * TRAIN_RATIO)
 
@@ -67,27 +73,33 @@ def main():
     print(f"Train rows: {split_idx}")
     print(f"Test rows: {total_rows - split_idx}")
 
-    train_df = merged.iloc[:split_idx]
-    test_df = merged.iloc[split_idx:]
+    train_df = merged.iloc[:split_idx].copy()
+    test_df = merged.iloc[split_idx:].copy()
+
+    # Identify columns
+    state_columns = [c for c in state_df.columns if c != "timestamp"]
+    request_columns = [c for c in req_df.columns if c != "timestamp"]
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    train_df[state_df.columns].to_csv(
+    # Save train
+    train_df[["timestamp"] + state_columns].to_csv(
         os.path.join(OUTPUT_DIR, "train_state.csv"),
         index=False
     )
 
-    train_df[req_df.columns].to_csv(
+    train_df[["timestamp"] + request_columns].to_csv(
         os.path.join(OUTPUT_DIR, "train_requests.csv"),
         index=False
     )
 
-    test_df[state_df.columns].to_csv(
+    # Save test
+    test_df[["timestamp"] + state_columns].to_csv(
         os.path.join(OUTPUT_DIR, "test_state.csv"),
         index=False
     )
 
-    test_df[req_df.columns].to_csv(
+    test_df[["timestamp"] + request_columns].to_csv(
         os.path.join(OUTPUT_DIR, "test_requests.csv"),
         index=False
     )
