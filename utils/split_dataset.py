@@ -49,15 +49,20 @@ def main():
     state_df = pd.read_csv(state_file)
     req_df = pd.read_csv(requests_file)
 
-    # Convert timestamps
+    # Normalize timestamps
     state_df["timestamp"] = pd.to_datetime(state_df["timestamp"])
     req_df["timestamp"] = pd.to_datetime(req_df["timestamp"])
 
-    # Sort chronologically (critical for time-series ML)
+    # Sort chronologically (CRITICAL for time series)
     state_df = state_df.sort_values("timestamp")
     req_df = req_df.sort_values("timestamp")
 
-    # Merge datasets safely by time
+    # Rename request column to avoid merge conflicts
+    req_df = req_df.rename(columns={
+        "requests_per_min": "requests"
+    })
+
+    # Merge datasets
     merged = pd.merge_asof(
         state_df,
         req_df,
@@ -65,7 +70,6 @@ def main():
         direction="nearest"
     )
 
-    # Time-series safe split
     total_rows = len(merged)
     split_idx = int(total_rows * TRAIN_RATIO)
 
@@ -76,30 +80,30 @@ def main():
     train_df = merged.iloc[:split_idx].copy()
     test_df = merged.iloc[split_idx:].copy()
 
-    # Identify columns
-    state_columns = [c for c in state_df.columns if c != "timestamp"]
-    request_columns = [c for c in req_df.columns if c != "timestamp"]
-
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # Save train
-    train_df[["timestamp"] + state_columns].to_csv(
+    # Save state files
+    state_columns = [c for c in state_df.columns]
+
+    train_df[state_columns].to_csv(
         os.path.join(OUTPUT_DIR, "train_state.csv"),
         index=False
     )
 
-    train_df[["timestamp"] + request_columns].to_csv(
-        os.path.join(OUTPUT_DIR, "train_requests.csv"),
-        index=False
-    )
-
-    # Save test
-    test_df[["timestamp"] + state_columns].to_csv(
+    test_df[state_columns].to_csv(
         os.path.join(OUTPUT_DIR, "test_state.csv"),
         index=False
     )
 
-    test_df[["timestamp"] + request_columns].to_csv(
+    # Save request files
+    request_columns = ["timestamp", "requests"]
+
+    train_df[request_columns].to_csv(
+        os.path.join(OUTPUT_DIR, "train_requests.csv"),
+        index=False
+    )
+
+    test_df[request_columns].to_csv(
         os.path.join(OUTPUT_DIR, "test_requests.csv"),
         index=False
     )
