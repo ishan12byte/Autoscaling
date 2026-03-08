@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-# controllers/run_rule_based_sim.py
 """
-Net-aware rule-based baseline simulator (NO ML / NO OLS).
-Reads state + requests, simulates capacity & CPU, applies rule-based scaling,
-logs per-step CSV and produces a summary JSON.
+controllers/run_rule_based_sim.py
+
+Net-aware rule-based baseline simulator (NO ML).
+Upgrades:
+ - overload defined by service-degradation signals (cpu, latency, queue)
+ - sustained overload detection (overload_streak)
+ - queue growth detection (queue_delta + queue_growth_streak)
+ - logs new fields: overload_streak, queue_delta, queue_growth_streak, queue_growth_flag, cpu_overload_cond, latency_overload_cond, queue_overload_cond
 
 Usage example:
 python controllers/run_rule_based_sim.py \
   --state-file data/train_state.csv \
   --requests-file data/train_requests.csv \
-  --output-csv data/train_baseline.csv
+  --output-csv data/train_baseline.csv \
+  --max-instances 12 \
+  --workers-per-instance 8
 """
 import sys
 import os
@@ -22,34 +28,45 @@ from datetime import datetime, timezone
 import pandas as pd
 import argparse
 
-# allow import from project root
+# ensure project-root imports work (so config.settings can be used if present)
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import settings as cfg  # type: ignore
+try:
+    from config import settings as cfg  # type: ignore
+except Exception:
+    cfg = None
 
 # ---------- CLI ----------
 parser = argparse.ArgumentParser(description="Net-aware rule-based baseline simulator (no ML).")
-parser.add_argument("--state-file", type=str, default=getattr(cfg, "STATE_FILE", "data/state.csv"))
-parser.add_argument("--requests-file", type=str, default=getattr(cfg, "REQUESTS_FILE", "data/requests.csv"))
-parser.add_argument("--output-csv", type=str, default=os.path.join(getattr(cfg, "DATA_DIR", "data"), "baseline_simulation.csv"))
-parser.add_argument("--metrics-out", type=str, default=os.path.join(getattr(cfg, "DATA_DIR", "data"), "baseline_metrics.json"))
-parser.add_argument("--max-instances", type=int, default=getattr(cfg, "MAX_INSTANCES", 4))
-parser.add_argument("--min-instances", type=int, default=getattr(cfg, "MIN_INSTANCES", 1))
-parser.add_argument("--workers-per-instance", type=int, default=getattr(cfg, "WORKERS_PER_INSTANCE", 1))
+parser.add_argument("--state-file", type=str, default=(getattr(cfg, "STATE_FILE", "data/state.csv") if cfg else "data/state.csv"))
+parser.add_argument("--requests-file", type=str, default=(getattr(cfg, "REQUESTS_FILE", "data/requests.csv") if cfg else "data/requests.csv"))
+parser.add_argument("--output-csv", type=str, default=os.path.join((getattr(cfg, "DATA_DIR", "data") if cfg else "data"), "baseline_simulation.csv"))
+parser.add_argument("--metrics-out", type=str, default=os.path.join((getattr(cfg, "DATA_DIR", "data") if cfg else "data"), "baseline_metrics.json"))
+parser.add_argument("--max-instances", type=int, default=(getattr(cfg, "MAX_INSTANCES", 12) if cfg else 12))
+parser.add_argument("--min-instances", type=int, default=(getattr(cfg, "MIN_INSTANCES", 1) if cfg else 1))
+parser.add_argument("--workers-per-instance", type=int, default=(getattr(cfg, "WORKERS_PER_INSTANCE", 8) if cfg else 8))
 parser.add_argument("--k-req", type=float, default=1.25, help="K for request-driven CPU")
 parser.add_argument("--k-net", type=float, default=1.0, help="K for network-driven CPU")
 parser.add_argument("--w-req", type=float, default=0.7, help="Weight for request CPU contribution")
 parser.add_argument("--w-net", type=float, default=0.3, help="Weight for network CPU contribution")
-parser.add_argument("--alpha", type=float, default=getattr(cfg, "ALPHA", 0.25))
-parser.add_argument("--inefficiency", type=float, default=getattr(cfg, "INEFFICIENCY", 0.85))
+parser.add_argument("--alpha", type=float, default=(getattr(cfg, "ALPHA", 0.25) if cfg else 0.25))
+parser.add_argument("--inefficiency", type=float, default=(getattr(cfg, "INEFFICIENCY", 0.85) if cfg else 0.85))
 parser.add_argument("--bandwidth-per-instance", type=float, default=None,
                     help="Bandwidth capacity per instance in same units as avg_net_* columns. If not set, auto-estimated.")
-parser.add_argument("--scale-up-streak", type=int, default=getattr(cfg, "SCALE_UP_STREAK", 3))
-parser.add_argument("--scale-down-streak", type=int, default=getattr(cfg, "SCALE_DOWN_STREAK", 5))
-parser.add_argument("--cooldown-steps", type=int, default=getattr(cfg, "COOLDOWN_STEPS", 3))
-parser.add_argument("--base-latency-ms", type=float, default=getattr(cfg, "BASE_LATENCY", 50.0))
-parser.add_argument("--sampling-interval-seconds", type=int, default=getattr(cfg, "SAMPLING_INTERVAL", 60))
+parser.add_argument("--scale-up-streak", type=int, default=(getattr(cfg, "SCALE_UP_STREAK", 3) if cfg else 3))
+parser.add_argument("--scale-down-streak", type=int, default=(getattr(cfg, "SCALE_DOWN_STREAK", 5) if cfg else 5))
+parser.add_argument("--cooldown-steps", type=int, default=(getattr(cfg, "COOLDOWN_STEPS", 3) if cfg else 3))
+parser.add_argument("--base-latency-ms", type=float, default=(getattr(cfg, "BASE_LATENCY", 50.0) if cfg else 50.0))
+parser.add_argument("--sampling-interval-seconds", type=int, default=(getattr(cfg, "SAMPLING_INTERVAL", 60) if cfg else 60))
 parser.add_argument("--merge-tolerance-multiplier", type=float, default=1.1)
-parser.add_argument("--queue-persistence", action="store_true")
+# overload / sustained thresholds
+parser.add_argument("--cpu-overload-threshold", type=float, default=90.0, help="CPU %% above which we consider overloaded")
+parser.add_argument("--latency-overload-threshold-ms", type=float, default=1000.0, help="Latency (ms) above which overload is considered")
+parser.add_argument("--queue-overload-threshold", type=float, default=10.0, help="Queue length above which overload is considered")
+parser.add_argument("--overload-sustained-steps", type=int, default=3, help="Number of consecutive steps to mark sustained overload")
+# queue growth detection
+parser.add_argument("--queue-growth-threshold", type=float, default=5.0, help="queue_delta above which counts as growth")
+parser.add_argument("--queue-growth-streak", type=int, default=3, help="consecutive queue-delta steps to flag growth")
+parser.add_argument("--queue-persistence", action="store_true", help="Enable queue persistence across steps")
 parser.add_argument("--clamp-load-ratio", type=float, default=5.0)
 parser.add_argument("--verbose", action="store_true")
 args = parser.parse_args()
@@ -81,6 +98,14 @@ BASE_LATENCY = float(args.base_latency_ms)
 SAMPLING_INTERVAL = int(args.sampling_interval_seconds)
 MERGE_TOL = pd.Timedelta(seconds=int(SAMPLING_INTERVAL * args.merge_tolerance_multiplier))
 
+CPU_OVERLOAD_THRESHOLD = float(args.cpu_overload_threshold)
+LATENCY_OVERLOAD_THRESHOLD_MS = float(args.latency_overload_threshold_ms)
+QUEUE_OVERLOAD_THRESHOLD = float(args.queue_overload_threshold)
+OVERLOAD_SUSTAINED_STEPS = int(args.overload_sustained_steps)
+
+QUEUE_GROWTH_THRESHOLD = float(args.queue_growth_threshold)
+QUEUE_GROWTH_STREAK = int(args.queue_growth_streak)
+
 QUEUE_PERSISTENCE = bool(args.queue_persistence)
 LOAD_RATIO_CLAMP = float(args.clamp_load_ratio)
 VERBOSE = bool(args.verbose)
@@ -107,30 +132,37 @@ if "timestamp" not in state_df.columns:
 state_df["timestamp"] = pd.to_datetime(state_df["timestamp"], utc=True)
 state_df = state_df.sort_values("timestamp").reset_index(drop=True)
 
-# ensure net columns exist
+# ensure net columns exist (compatibility)
 if "avg_net_in_5" not in state_df.columns:
     state_df["avg_net_in_5"] = 0.0
 if "avg_net_out_5" not in state_df.columns:
     state_df["avg_net_out_5"] = 0.0
 
+# load requests (if exists) and accept both 'requests' and 'requests_per_min'
 if os.path.exists(REQUESTS_FILE):
     req_df = pd.read_csv(REQUESTS_FILE)
-    if "timestamp" not in req_df.columns or "requests_per_min" not in req_df.columns:
-        raise KeyError("requests CSV must include 'timestamp' and 'requests_per_min'")
+    if "timestamp" not in req_df.columns:
+        raise KeyError("requests CSV must include 'timestamp' column")
+    # accept either name
+    if "requests_per_min" in req_df.columns and "requests" not in req_df.columns:
+        req_df = req_df.rename(columns={"requests_per_min": "requests"})
+    if "requests" not in req_df.columns:
+        raise KeyError("requests CSV must include 'requests' or 'requests_per_min' column")
     req_df["timestamp"] = pd.to_datetime(req_df["timestamp"], utc=True)
     req_df = req_df.sort_values("timestamp").reset_index(drop=True)
 else:
-    req_df = pd.DataFrame({"timestamp": state_df["timestamp"], "requests_per_min": 0.0})
+    req_df = pd.DataFrame({"timestamp": state_df["timestamp"], "requests": 0.0})
     if VERBOSE:
         print("requests file missing — using zero requests")
 
 merged = pd.merge_asof(state_df, req_df, on="timestamp", direction="nearest", tolerance=MERGE_TOL)
-n_na = merged["requests_per_min"].isna().sum()
+
+n_na = merged["requests"].isna().sum()
 if n_na:
     warnings.warn(f"{n_na} rows had no nearby requests within tolerance ({MERGE_TOL}); filling with 0.")
-merged["requests_per_min"] = merged["requests_per_min"].fillna(0.0)
+merged["requests"] = merged["requests"].fillna(0.0)
 
-required_cols = ["avg_cpu_5", "avg_net_in_5", "avg_net_out_5", "requests_per_min"]
+required_cols = ["avg_cpu_5", "avg_net_in_5", "avg_net_out_5", "requests"]
 nan_rows = merged[required_cols].isna().any(axis=1).sum()
 if nan_rows:
     warnings.warn(f"Dropping {nan_rows} rows with NaNs in required numeric columns.")
@@ -160,10 +192,17 @@ prev_action = None
 queue_prev = 0.0
 
 oscillation_count = 0
-overload_count = 0
+overload_count = 0                # counts rows where sustained overload flagged
+overload_event_count = 0         # counts overload event starts
 total_instance_minutes = 0.0
 peak_queue = 0.0
 latency_accum = 0.0
+
+overload_streak = 0
+max_overload_streak = 0
+
+queue_growth_streak = 0
+queue_growth_event_count = 0
 
 # ---------- output CSV ----------
 headers = [
@@ -182,23 +221,29 @@ headers = [
     "cpu_smoothed",
     "latency_ms",
     "queue_length",
+    "queue_delta",
+    "queue_growth_flag",
+    "queue_growth_streak",
     "high_streak",
     "low_streak",
     "cooldown_timer",
     "action",
     "prev_action",
     "oscillation_flag",
+    "cpu_overload_cond",
+    "latency_overload_cond",
+    "queue_overload_cond",
+    "overload_streak",
     "overload_flag"
 ]
 os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
-file_exists = os.path.exists(OUTPUT_FILE)
 out_f = open(OUTPUT_FILE, "w", newline="")
 writer = csv.writer(out_f)
 writer.writerow(headers)
 
-# ---------- init cpu_prev ----------
+# ---------- init cpu_prev using first row to avoid startup bias ----------
 first_row = merged.iloc[0]
-init_requests = float(first_row.get("requests_per_min", 0.0))
+init_requests = float(first_row.get("requests", 0.0))
 init_capacity = instances * WORKERS_PER_INSTANCE
 init_effective_capacity = max(0.1, init_capacity * INEFFICIENCY)
 init_request_ratio = init_requests / init_effective_capacity if init_effective_capacity > 0 else 0.0
@@ -213,14 +258,17 @@ init_cpu_net = 100.0 * (1.0 - math.exp(-K_NET * init_network_ratio))
 init_cpu_combined = W_REQ * init_cpu_req + W_NET * init_cpu_net
 cpu_prev = min(100.0, init_cpu_combined)
 
+prev_overload_flag = 0
+
 # ---------- main loop ----------
 for idx, row in merged.iterrows():
     timestamp = row["timestamp"]
-    requests = float(row.get("requests_per_min", 0.0))
+    requests = float(row.get("requests", 0.0))
     net_in = float(row.get("avg_net_in_5", 0.0))
     net_out = float(row.get("avg_net_out_5", 0.0))
     net_throughput = net_in + net_out
 
+    # capacity / effective capacity
     capacity = instances * WORKERS_PER_INSTANCE
     effective_capacity = max(0.1, capacity * INEFFICIENCY)
 
@@ -243,21 +291,22 @@ for idx, row in merged.iterrows():
     cpu_target_combined = W_REQ * cpu_req_target + W_NET * cpu_net_target
     cpu_target_combined = min(cpu_target_combined, 100.0)
 
-    # smoothing
+    # smoothing / inertia
     cpu_smoothed = ALPHA * cpu_target_combined + (1.0 - ALPHA) * cpu_prev
     cpu_smoothed = min(max(cpu_smoothed, 0.0), 100.0)
 
-    # queue persistence optional
+    # queue persistence (optional)
     if QUEUE_PERSISTENCE:
         queue_length = max(0.0, queue_prev + requests - effective_capacity)
     else:
         queue_length = max(0.0, requests - effective_capacity)
+    queue_delta = queue_length - queue_prev
     queue_prev = queue_length
 
-    # latency proxy
+    # latency proxy (grows with both ratios)
     latency_ms = BASE_LATENCY * (1.0 + (request_ratio + network_ratio) ** 2)
 
-    # streak/hysteresis
+    # streak/hysteresis logic
     if cpu_smoothed > 70.0:
         high_streak += 1
         low_streak = 0
@@ -300,9 +349,36 @@ for idx, row in merged.iterrows():
     if action != "hold":
         prev_action = action
 
-    # overload if either resource ratio > 1
-    overload_flag = int((request_ratio > 1.0) or (network_ratio > 1.0))
-    overload_count += overload_flag
+    # overload conditions (component flags)
+    cpu_overload_cond = int(cpu_smoothed > CPU_OVERLOAD_THRESHOLD)
+    latency_overload_cond = int(latency_ms > LATENCY_OVERLOAD_THRESHOLD_MS)
+    queue_overload_cond = int(queue_length > QUEUE_OVERLOAD_THRESHOLD)
+
+    # queue growth detection
+    if queue_delta > QUEUE_GROWTH_THRESHOLD:
+        queue_growth_streak += 1
+    else:
+        queue_growth_streak = 0
+    queue_growth_flag = int(queue_growth_streak >= QUEUE_GROWTH_STREAK)
+    if queue_growth_flag and (queue_growth_streak == QUEUE_GROWTH_STREAK):
+        queue_growth_event_count += 1
+
+    # sustained overload: increment streak when any degradation condition true
+    if (cpu_overload_cond or latency_overload_cond or queue_overload_cond or queue_growth_flag):
+        overload_streak += 1
+    else:
+        overload_streak = 0
+
+    if overload_streak > max_overload_streak:
+        max_overload_streak = overload_streak
+
+    overload_flag = int(overload_streak >= OVERLOAD_SUSTAINED_STEPS)
+    # count overload event start
+    if overload_flag and not prev_overload_flag:
+        overload_event_count += 1
+    prev_overload_flag = bool(overload_flag)
+    if overload_flag:
+        overload_count += 1
 
     # costs & accumulators
     total_instance_minutes += instances * (SAMPLING_INTERVAL / 60.0)
@@ -326,16 +402,23 @@ for idx, row in merged.iterrows():
         round(cpu_smoothed, 4),
         round(latency_ms, 4),
         round(queue_length, 4),
+        round(queue_delta, 4),
+        int(queue_growth_flag),
+        int(queue_growth_streak),
         int(high_streak),
         int(low_streak),
         int(cooldown_timer),
         action,
         prev_action_logged,
         int(oscillation_flag),
+        int(cpu_overload_cond),
+        int(latency_overload_cond),
+        int(queue_overload_cond),
+        int(overload_streak),
         int(overload_flag)
     ])
 
-    # advance
+    # advance for next step
     cpu_prev = cpu_smoothed
 
 # close and summarize
@@ -346,7 +429,10 @@ avg_latency = (latency_accum / n_rows) if n_rows > 0 else 0.0
 
 summary = {
     "rows_simulated": n_rows,
-    "overload_events": int(overload_count),
+    "sustained_overload_rows": int(overload_count),
+    "sustained_overload_events": int(overload_event_count),
+    "max_overload_streak": int(max_overload_streak),
+    "queue_growth_events": int(queue_growth_event_count),
     "oscillation_count": int(oscillation_count),
     "total_instance_minutes": round(total_instance_minutes, 3),
     "avg_instances": round(avg_instances, 3),
@@ -367,6 +453,12 @@ summary = {
         "scale_down_streak": SCALE_DOWN_STREAK,
         "cooldown_steps": COOLDOWN_STEPS,
         "queue_persistence": QUEUE_PERSISTENCE,
+        "overload_sustained_steps": OVERLOAD_SUSTAINED_STEPS,
+        "cpu_overload_threshold": CPU_OVERLOAD_THRESHOLD,
+        "latency_overload_threshold_ms": LATENCY_OVERLOAD_THRESHOLD_MS,
+        "queue_overload_threshold": QUEUE_OVERLOAD_THRESHOLD,
+        "queue_growth_threshold": QUEUE_GROWTH_THRESHOLD,
+        "queue_growth_streak": QUEUE_GROWTH_STREAK,
         "sampling_interval_seconds": SAMPLING_INTERVAL
     },
     "output_csv": OUTPUT_FILE
@@ -378,7 +470,10 @@ with open(METRICS_OUT, "w") as mf:
 print("\n Baseline simulation finished")
 print("----------------------------------------")
 print(f"Rows simulated:         {n_rows}")
-print(f"Overload events:        {summary['overload_events']}")
+print(f"Sustained overload rows: {summary['sustained_overload_rows']}")
+print(f"Sustained overload events: {summary['sustained_overload_events']}")
+print(f"Max overload streak:    {summary['max_overload_streak']}")
+print(f"Queue growth events:    {summary['queue_growth_events']}")
 print(f"Oscillation_count:      {summary['oscillation_count']}")
 print(f"Total instance-minutes: {summary['total_instance_minutes']}")
 print(f"Average instances:      {summary['avg_instances']}")
@@ -389,4 +484,3 @@ print(f"Summary JSON:           {METRICS_OUT}")
 if VERBOSE:
     print("\nParameters used:")
     print(json.dumps(summary["parameters"], indent=2))
-
