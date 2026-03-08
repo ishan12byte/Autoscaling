@@ -1,113 +1,156 @@
 #!/usr/bin/env python3
-# evaluation/eval_baseline.py
 """
-Evaluator for rule-based baseline simulation output.
-Reads baseline CSV and produces a JSON summary + printed report.
-(STRICTLY NO ML/OLS code here.)
+evaluation/eval_baseline.py
+
+Compute evaluation metrics for baseline CSV produced by run_rule_based_sim.py.
+Handles new sustained overload and queue-growth fields; if they are missing,
+it attempts to reconstruct sensible measures from available signals.
 """
-import sys
-import os
-import json
 import argparse
-from statistics import mean
-
+import json
 import pandas as pd
+from datetime import datetime
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import settings as cfg  # type: ignore
-
-parser = argparse.ArgumentParser(description="Evaluate baseline simulation output.")
-parser.add_argument("--input-csv", type=str, default=os.path.join(getattr(cfg, "DATA_DIR", "data"), "baseline_simulation.csv"))
-parser.add_argument("--output-json", type=str, default=os.path.join(getattr(cfg, "DATA_DIR", "data"), "baseline_eval_summary.json"))
+parser = argparse.ArgumentParser(description="Evaluate baseline CSV")
+parser.add_argument("--input-csv", type=str, required=True)
+parser.add_argument("--out-json", type=str, default=None)
 args = parser.parse_args()
 
-INPUT = args.input_csv
-OUT_JSON = args.output_json
+df = pd.read_csv(args.input_csv)
+n_rows = len(df)
 
-if not os.path.exists(INPUT):
-    raise FileNotFoundError(f"Baseline CSV not found: {INPUT}")
+# ensure timestamp is datetime
+if "timestamp" in df.columns:
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 
-df = pd.read_csv(INPUT)
+# New columns available?
+has_overload_flag = "overload_flag" in df.columns
+has_overload_streak = "overload_streak" in df.columns
+has_queue_growth_flag = "queue_growth_flag" in df.columns
 
-# required core columns
-core_required = ["instances", "overload_flag", "oscillation_flag", "queue_length", "latency_ms", "cpu_smoothed"]
-missing_core = [c for c in core_required if c not in df.columns]
-if missing_core:
-    raise KeyError(f"Evaluator expected core columns missing from {INPUT}: {missing_core}")
+# If not available, try to reconstruct basic signals
+if not has_overload_flag:
+    # try to reconstruct from cpu_smoothed, latency_ms, queue_length if present
+    cpu_col = "cpu_smoothed" if "cpu_smoothed" in df.columns else None
+    latency_col = "latency_ms" if "latency_ms" in df.columns else None
+    queue_col = "queue_length" if "queue_length" in df.columns else None
 
-report = {}
-report["rows"] = len(df)
+    # default thresholds (same as simulator defaults)
+    cpu_thr = 90.0
+    lat_thr = 1000.0
+    q_thr = 10.0
 
-# Overload
-report["overload_events"] = int(df["overload_flag"].sum())
-report["overload_pct"] = float(100.0 * df["overload_flag"].sum() / len(df)) if len(df) > 0 else 0.0
+    conds = []
+    if cpu_col:
+        conds.append(df[cpu_col] > cpu_thr)
+    if latency_col:
+        conds.append(df[latency_col] > lat_thr)
+    if queue_col:
+        conds.append(df[queue_col] > q_thr)
 
-# Longest overload streak
-streak = 0
-max_streak = 0
-for flag in df["overload_flag"]:
-    if int(flag) == 1:
-        streak += 1
-        if streak > max_streak:
-            max_streak = streak
-    else:
+    if conds:
+        import numpy as np
+        combined = np.zeros(len(df), dtype=bool)
+        for c in conds:
+            combined = combined | c
+        df["recon_overload_cond"] = combined
+        # sustained: require 3 consecutive
+        df["recon_overload_flag"] = False
         streak = 0
-report["longest_overload_streak"] = int(max_streak)
+        for i, val in enumerate(df["recon_overload_cond"]):
+            if val:
+                streak += 1
+            else:
+                streak = 0
+            if streak >= 3:
+                df.at[i, "recon_overload_flag"] = True
+        has_overload_flag = True
+        df["overload_flag"] = df["recon_overload_flag"]
+        print("Note: reconstructed overload_flag from available signals")
+    else:
+        # fallback: consider request_ratio > 1 if present
+        if "request_ratio" in df.columns:
+            df["overload_flag"] = df["request_ratio"] > 1.0
+            has_overload_flag = True
+            print("Note: fallback overload_flag from request_ratio > 1")
 
-# Cost
-report["avg_instances"] = float(df["instances"].mean())
-report["peak_instances"] = int(df["instances"].max())
-# instance-minutes proxy: sum(instances) * (sampling_interval_seconds/60)
-# We don't have sampling interval in file—use settings if available
-sampling_interval = getattr(cfg, "SAMPLING_INTERVAL", 60)
-report["instance_minutes_proxy"] = float(df["instances"].sum() * (sampling_interval / 60.0))
+# compute sustained events and streaks using overload_flag column
+overload_rows = int(df["overload_flag"].astype(int).sum())
+# find longest consecutive streak of overload_flag==1
+longest_streak = 0
+cur = 0
+for v in df["overload_flag"].astype(int):
+    if v:
+        cur += 1
+        if cur > longest_streak:
+            longest_streak = cur
+    else:
+        cur = 0
 
-# Stability
-report["oscillation_events"] = int(df["oscillation_flag"].sum()) if "oscillation_flag" in df.columns else 0
-report["oscillation_rate_pct"] = float(100.0 * report["oscillation_events"] / len(df)) if len(df) > 0 else 0.0
+# count event starts (0 -> 1 transitions)
+event_starts = 0
+prev = 0
+for v in df["overload_flag"].astype(int):
+    if v and not prev:
+        event_starts += 1
+    prev = v
 
-# Queue & latency
-report["avg_queue_length"] = float(df["queue_length"].mean()) if "queue_length" in df.columns else 0.0
-report["peak_queue_length"] = float(df["queue_length"].max()) if "queue_length" in df.columns else 0.0
-report["avg_latency_ms"] = float(df["latency_ms"].mean()) if "latency_ms" in df.columns else 0.0
-report["peak_latency_ms"] = float(df["latency_ms"].max()) if "latency_ms" in df.columns else 0.0
+# Oscillation count (if present)
+oscillations = int(df["oscillation_flag"].sum()) if "oscillation_flag" in df.columns else None
 
-# Network metrics: throughput and ratio
-if "net_throughput" in df.columns:
-    report["avg_net_throughput"] = float(df["net_throughput"].mean())
-    report["peak_net_throughput"] = float(df["net_throughput"].max())
-else:
-    report["avg_net_throughput"] = None
-    report["peak_net_throughput"] = None
+# instances / cost
+avg_instances = df["instances"].mean() if "instances" in df.columns else None
+total_instance_minutes = None
+if avg_instances is not None:
+    # sampling interval not present in CSV; assume 60s if not available
+    sampling_seconds = 60
+    if "sampling_interval_seconds" in df.columns:
+        sampling_seconds = int(df["sampling_interval_seconds"].iloc[0])
+    total_instance_minutes = (df["instances"].sum() * (sampling_seconds / 60.0)) if "instances" in df.columns else None
 
-# CPU breakdown averages if available
-if "cpu_req_target" in df.columns and "cpu_net_target" in df.columns:
-    report["avg_cpu_req_target"] = float(df["cpu_req_target"].mean())
-    report["avg_cpu_net_target"] = float(df["cpu_net_target"].mean())
-    report["avg_cpu_combined_target"] = float(df["cpu_target_combined"].mean()) if "cpu_target_combined" in df.columns else None
-else:
-    report["avg_cpu_req_target"] = None
-    report["avg_cpu_net_target"] = None
-    report["avg_cpu_combined_target"] = None
+# queue metrics
+avg_queue = df["queue_length"].mean() if "queue_length" in df.columns else None
+peak_queue = df["queue_length"].max() if "queue_length" in df.columns else None
 
-# Save JSON summary
-with open(OUT_JSON, "w") as f:
-    json.dump(report, f, indent=2)
+# latency
+avg_latency = df["latency_ms"].mean() if "latency_ms" in df.columns else None
+peak_latency = df["latency_ms"].max() if "latency_ms" in df.columns else None
 
-# Print summary
-print("\n✅ Baseline Evaluation Summary")
+# queue growth events
+queue_growth_events = int(df["queue_growth_flag"].sum()) if "queue_growth_flag" in df.columns else None
+
+summary = {
+    "rows": int(n_rows),
+    "sustained_overload_rows": int(overload_rows),
+    "sustained_overload_event_starts": int(event_starts),
+    "longest_sustained_overload_streak": int(longest_streak),
+    "queue_growth_events": queue_growth_events,
+    "oscillation_events": oscillations,
+    "avg_instances": float(avg_instances) if avg_instances is not None else None,
+    "total_instance_minutes": float(total_instance_minutes) if total_instance_minutes is not None else None,
+    "avg_queue_length": float(avg_queue) if avg_queue is not None else None,
+    "peak_queue_length": float(peak_queue) if peak_queue is not None else None,
+    "avg_latency_ms": float(avg_latency) if avg_latency is not None else None,
+    "peak_latency_ms": float(peak_latency) if peak_latency is not None else None,
+    "evaluated_at": datetime.utcnow().isoformat() + "Z",
+    "input_csv": args.input_csv
+}
+
+out_json = args.out_json or args.input_csv.replace(".csv", "_eval_summary.json")
+with open(out_json, "w") as f:
+    json.dump(summary, f, indent=2)
+
+# pretty print
+print("\n Baseline Evaluation Summary")
 print("---------------------------------------")
-print(f"Rows: {report['rows']}")
-print(f"Overload events: {report['overload_events']} ({report['overload_pct']:.2f}%)")
-print(f"Longest overload streak: {report['longest_overload_streak']}")
-print(f"Average instances: {report['avg_instances']:.2f}")
-print(f"Peak instances: {report['peak_instances']}")
-print(f"Instance-minutes (proxy): {report['instance_minutes_proxy']:.2f}")
-print(f"Oscillation events: {report['oscillation_events']} ({report['oscillation_rate_pct']:.2f}%)")
-print(f"Avg queue length: {report['avg_queue_length']:.2f}, Peak queue: {report['peak_queue_length']:.2f}")
-print(f"Avg latency (ms): {report['avg_latency_ms']:.2f}, Peak latency (ms): {report['peak_latency_ms']:.2f}")
-if report["avg_net_throughput"] is not None:
-    print(f"Avg net throughput: {report['avg_net_throughput']:.2f}, Peak: {report['peak_net_throughput']:.2f}")
-if report["avg_cpu_req_target"] is not None:
-    print(f"Avg cpu_req_target: {report['avg_cpu_req_target']:.2f}, Avg cpu_net_target: {report['avg_cpu_net_target']:.2f}")
-print(f"Saved JSON summary: {OUT_JSON}")
+print(f"Rows: {summary['rows']}")
+print(f"Sustained overload rows: {summary['sustained_overload_rows']} ({summary['sustained_overload_rows'] / summary['rows'] * 100:.2f}%)")
+print(f"Sustained overload event starts: {summary['sustained_overload_event_starts']}")
+print(f"Longest sustained overload streak: {summary['longest_sustained_overload_streak']}")
+print(f"Queue growth events: {summary['queue_growth_events']}")
+print(f"Oscillation events: {summary['oscillation_events']}")
+print(f"Average instances: {summary['avg_instances']}")
+print(f"Instance-minutes (proxy): {summary['total_instance_minutes']}")
+print(f"Avg queue length: {summary['avg_queue_length']}, Peak queue: {summary['peak_queue_length']}")
+print(f"Avg latency (ms): {summary['avg_latency_ms']}, Peak latency (ms): {summary['peak_latency_ms']}")
+print(f"Saved JSON summary: {out_json}")
