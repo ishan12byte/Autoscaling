@@ -3,7 +3,8 @@ A Control-System & Machine Learning Approach to Infrastructure Scaling
 
 🚀 Overview
 
-Modern infrastructure scaling is typically reactive, heuristic-driven, and brittle under uncertainty. This project reframes autoscaling as a sequential decision-making problem, combining:
+Modern infrastructure scaling is typically reactive, heuristic-driven, and brittle under uncertainty.
+This project reframes autoscaling as a sequential decision-making problem, combining:
 
 ✔ Control-system modelling
 ✔ Predictive machine learning
@@ -25,7 +26,7 @@ Build a production-credible simulation environment that:
 
 🧠 Core Concept
 
-Infrastructure behaviour is simulated using:
+Infrastructure behaviour is simulated using the relationship:
 
 Demand → Capacity → Utilization
 
@@ -57,21 +58,21 @@ ML / RL Models
 project_root/
 │
 ├── app/
-│   └── app.py                  # CPU-bound workload service
+│   └── app.py                     # CPU-bound workload service
 │
 ├── collectors/
-│   ├── ec2_metrics.py          # CloudWatch metrics collector
-│   └── requests_metrics.py     # Workload / request collector
+│   ├── ec2_metrics.py             # CloudWatch metrics collector
+│   └── requests_metrics.py        # Workload / request collector
 │
 ├── controllers/
-│   ├── rule_based.py           # Static scaling policy
-│   └── run_rule_based_sim.py   # Infrastructure dynamics simulator
+│   ├── rule_based.py              # Static scaling policy
+│   └── run_rule_based_sim.py      # Infrastructure dynamics simulator
 │
 ├── evaluation/
-│   └── eval_baseline.py        # Performance evaluator
+│   └── eval_baseline.py           # Performance evaluator
 │
 ├── config/
-│   └── settings.py             # Central configuration
+│   └── settings.py                # Central configuration
 │
 ├── data/
 │   ├── metrics.csv
@@ -94,7 +95,7 @@ Models real-world inefficiencies:
 
 ✅ CPU Response Curve
 
-Nonlinear saturation:
+Nonlinear saturation model:
 
 cpu_target = 100 × (1 − exp(−k × load_ratio))
 
@@ -107,7 +108,7 @@ Why nonlinear?
 ✅ CPU Inertia (Realistic Dynamics)
 cpu_t = α × cpu_target + (1 − α) × cpu_previous
 
-Prevents unrealistic jumps.
+Prevents unrealistic jumps in utilization.
 
 ✅ Queue Persistence (Backpressure)
 
@@ -124,7 +125,7 @@ Simulates:
 ✅ Latency Proxy
 latency ∝ (1 + load_ratio²)
 
-Models nonlinear degradation under load.
+Models nonlinear degradation under heavy load.
 
 ✅ Scaling Stability Mechanisms
 
@@ -132,11 +133,11 @@ Models nonlinear degradation under load.
 ✔ Cooldown timers
 ✔ Instance guardrails
 
-Prevents oscillations and flapping.
+Prevents oscillations and scaling flapping.
 
 📊 Evaluation Metrics
 
-The system evaluates scaling quality via:
+The system evaluates scaling quality through the following metrics:
 
 🎯 Performance / SLA Metrics
 
@@ -162,22 +163,22 @@ The system evaluates scaling quality via:
 
 🧪 Baseline Policy
 
-Static rule controller:
+Static rule-based controller:
 
 IF cpu > 70 → scale_up
 IF cpu < 30 → scale_down
 ELSE → hold
 
-Enhanced by:
+Enhanced with:
 
 ✔ Sustained pressure detection
 ✔ Cooldown guardrails
 
-Serves as the benchmark for ML / RL policies.
+This baseline serves as the benchmark for ML / RL policies.
 
 🧠 Machine Learning Extensions
 
-This simulator provides a stable environment for:
+This simulator provides a stable environment for experimenting with:
 
 ✅ Predictive Models
 
@@ -192,37 +193,37 @@ This simulator provides a stable environment for:
 
 ✅ Reinforcement Learning
 
-Infrastructure framed as an MDP:
+Infrastructure is framed as a Markov Decision Process (MDP):
 
 State → Action → Transition → Reward
 
 RL agents learn:
 
-✔ Cost-performance tradeoffs
+✔ Cost–performance tradeoffs
 ✔ Stability-aware scaling
-✔ Proactive decisions
+✔ Proactive scaling decisions
 
 🛡️ Safety & Guardrails
 
-Simulation enforces:
+The simulation enforces:
 
 ✔ Maximum replicas
 ✔ Minimum replicas
 ✔ Cooldown periods
 ✔ No destructive actions
 
-Designed to mimic production-safe scaling behaviour.
+The design aims to mimic production-safe autoscaling behaviour.
 
 🚀 Running the System
 1️⃣ Start Workload Service
 gunicorn app.app:app --bind 0.0.0.0:8000 --workers 1
 2️⃣ Generate Synthetic Load
 
-Using hey load generator.
+Use the hey load generator to simulate traffic.
 
 3️⃣ Collect Metrics
 
-Run collectors via cron or manual execution.
+Run collectors via cron jobs or manual execution.
 
 4️⃣ Run Baseline Simulator
 python3 controllers/run_rule_based_sim.py
@@ -235,21 +236,21 @@ This project demonstrates:
 ✔ Infrastructure as a control system
 ✔ Scaling as sequential decision-making
 ✔ Limitations of static heuristics
-✔ Benefits of predictive & RL policies
-✔ Stability & safety awareness
+✔ Benefits of predictive and RL policies
+✔ Stability and safety awareness in scaling
 
 ✅ Success Criteria
 
-Improved controllers should show:
+Improved controllers should demonstrate:
 
 ✔ Fewer overload events
 ✔ Comparable or lower cost proxy
 ✔ Reduced oscillations
-✔ Better queue / latency behaviour
+✔ Improved queue and latency behaviour
 
 🔮 Future Extensions
 
-Planned enhancements:
+Planned enhancements include:
 
 • Multi-instance simulation
 • Warmup delays
